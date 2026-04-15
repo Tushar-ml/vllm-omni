@@ -1807,7 +1807,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # Resolve reference voice with priority:
             # 1) uploaded speaker by voice name
             # 2) explicit ref_audio + ref_text provided in request
-            # 3) otherwise fail with voice-not-found style error
+            # 3) otherwise continue with default voice behavior
             ref_src = None
             if request.voice:
                 voice_lower = request.voice.lower()
@@ -1822,11 +1822,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ref_src = request.ref_audio
                 prompt["ref_text"] = request.ref_text
 
-            fmt_err = self._validate_ref_audio_format(ref_src)
-            if fmt_err:
-                raise ValueError(fmt_err)
-            wav, sr = await self._resolve_ref_audio(ref_src)
-            prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
+            if ref_src:
+                fmt_err = self._validate_ref_audio_format(ref_src)
+                if fmt_err:
+                    raise ValueError(fmt_err)
+                wav, sr = await self._resolve_ref_audio(ref_src)
+                prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
 
             # Request-level ref_text has precedence over stored ref_text.
             if request.ref_text:
