@@ -177,6 +177,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         instance._diffusion_stage_configs = stage_configs
+        # Mirror essential voice state from __init__ so voice management APIs
+        # work when OpenAIServing.__init__ is intentionally bypassed.
+        speech_voice_samples_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
+        instance.uploaded_speakers_dir = Path(speech_voice_samples_dir)
+        instance.uploaded_speakers_dir.mkdir(parents=True, exist_ok=True)
+        instance.uploaded_speakers = instance._load_persisted_uploaded_speakers()
+        # Diffusion mode bypasses __init__, so initialize speaker registry used
+        # by upload/delete/list voice flows.
+        instance.supported_speakers = set(instance.uploaded_speakers.keys())
+        if instance.uploaded_speakers:
+            logger.info("Loaded %d persisted uploaded voices (diffusion mode)", len(instance.uploaded_speakers))
+        else:
+            logger.info("No persisted uploaded voices found (diffusion mode)")
         return instance
 
     def __init__(self, *args, **kwargs):
@@ -208,13 +221,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Cache TTS configuration values (computed once, reused per request)
         self._max_instructions_length = self._compute_max_instructions_length()
 
-        # Load supported speakers (built-in only; uploaded voices start empty)
+        # Load supported speakers from model config first.
         self.supported_speakers = self._load_supported_speakers()
-        self.uploaded_speakers: dict[str, dict] = {}
-        logger.warning(
-            "Uploaded voices are ephemeral and will be lost on server restart. "
-            "Re-upload voices after each restart if needed."
-        )
+        self.uploaded_speakers = self._load_persisted_uploaded_speakers()
+        self.supported_speakers.update(self.uploaded_speakers.keys())
+        if self.uploaded_speakers:
+            logger.info("Loaded %d persisted uploaded voices", len(self.uploaded_speakers))
+        else:
+            logger.info("No persisted uploaded voices found")
         self._tts_tokenizer = None
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
@@ -351,6 +365,59 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning(f"Could not load speakers from model config: {e}")
 
         return set()
+
+    def _load_persisted_uploaded_speakers(self) -> dict[str, dict[str, Any]]:
+        """Load uploaded voice metadata persisted under per-voice directories."""
+        loaded: dict[str, dict[str, Any]] = {}
+
+        try:
+            for voice_dir in self.uploaded_speakers_dir.iterdir():
+                if not voice_dir.is_dir():
+                    continue
+
+                metadata_path = voice_dir / "metadata.json"
+                audio_path = voice_dir / "audio.wav"
+                if not metadata_path.exists() or not audio_path.exists():
+                    continue
+
+                if not _validate_path_within_directory(metadata_path, self.uploaded_speakers_dir):
+                    logger.warning("Skipping persisted voice with invalid metadata path: %s", metadata_path)
+                    continue
+                if not _validate_path_within_directory(audio_path, self.uploaded_speakers_dir):
+                    logger.warning("Skipping persisted voice with invalid audio path: %s", audio_path)
+                    continue
+
+                try:
+                    with open(metadata_path, encoding="utf-8") as f:
+                        speaker_data = json.load(f)
+                except Exception as e:
+                    logger.warning("Failed to read persisted metadata %s: %s", metadata_path, e)
+                    continue
+
+                if not isinstance(speaker_data, dict):
+                    logger.warning("Skipping invalid metadata format: %s", metadata_path)
+                    continue
+
+                voice_name = speaker_data.get("name")
+                if not isinstance(voice_name, str) or not voice_name.strip():
+                    logger.warning("Skipping metadata without valid voice name: %s", metadata_path)
+                    continue
+
+                voice_name_lower = voice_name.lower()
+                speaker_data["name"] = voice_name
+                speaker_data["file_path"] = str(audio_path)
+                speaker_data["metadata_path"] = str(metadata_path)
+                speaker_data["embedding_source"] = "audio"
+                speaker_data["persistent"] = True
+
+                loaded[voice_name_lower] = speaker_data
+        except FileNotFoundError:
+            # Directory may not exist yet in some startup paths.
+            return {}
+        except Exception as e:
+            logger.warning("Failed to load persisted uploaded voices: %s", e)
+
+        return loaded
 
     def _estimate_ref_code_len(self, ref_audio: object) -> int | None:
         """Estimate ref_code length from ref_audio waveform without running the codec.
@@ -532,6 +599,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         audio_file: UploadFile,
         consent: str,
         name: str,
+        persistent: bool = True,
         *,
         ref_text: str | None = None,
         speaker_description: str | None = None,
@@ -543,13 +611,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if speaker_description is not None:
             speaker_description = speaker_description.strip() or None
         # Validate file size (max 10MB)
-        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+        MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", 10 * 1024 * 1024))  # 10MB
         audio_file.file.seek(0, 2)  # Seek to end
         file_size = audio_file.file.tell()
         audio_file.file.seek(0)  # Reset to beginning
 
         if file_size > MAX_FILE_SIZE:
-            raise ValueError(f"File size exceeds maximum limit of 10MB. Got {file_size} bytes.")
+            raise ValueError(f"File size exceeds maximum limit of {MAX_FILE_SIZE} bytes. Got {file_size} bytes.")
 
         # Detect MIME type from filename if content_type is generic
         mime_type = audio_file.content_type
@@ -601,7 +669,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sanitized_name = _sanitize_filename(name)
         sanitized_consent = _sanitize_filename(consent)
 
-        # Generate filename with sanitized inputs
+        # Generate storage paths
         timestamp = int(time.time())
         file_suffix = Path(audio_file.filename).suffix
         file_ext = file_suffix[1:] if file_suffix and len(file_suffix) > 1 else "wav"
@@ -610,12 +678,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not sanitized_ext or sanitized_ext == "file":
             sanitized_ext = "wav"
 
-        filename = f"{sanitized_name}_{sanitized_consent}_{timestamp}.{sanitized_ext}"
-        file_path = self.uploaded_speakers_dir / filename
+        metadata_path: Path | None = None
+        voice_dir: Path | None = None
+        if persistent:
+            voice_dir = self.uploaded_speakers_dir / sanitized_name
+            file_path = voice_dir / "audio.wav"
+            metadata_path = voice_dir / "metadata.json"
+            if voice_dir.exists():
+                raise ValueError(
+                    f"Persistent voice directory for '{name}' already exists. "
+                    "Delete it first before re-uploading."
+                )
+        else:
+            filename = f"{sanitized_name}_{sanitized_consent}_{timestamp}.{sanitized_ext}"
+            file_path = self.uploaded_speakers_dir / filename
 
-        # Double-check that the path is within the upload directory
+        # Double-check that paths stay within upload directory
         if not _validate_path_within_directory(file_path, self.uploaded_speakers_dir):
             raise ValueError("Invalid file path: potential path traversal attack detected")
+        if metadata_path and not _validate_path_within_directory(metadata_path, self.uploaded_speakers_dir):
+            raise ValueError("Invalid metadata path: potential path traversal attack detected")
 
         # Read content and validate duration before saving
         content = await audio_file.read()
@@ -639,6 +721,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Save audio file
         try:
+            if voice_dir is not None:
+                voice_dir.mkdir(parents=True, exist_ok=False)
             with open(file_path, "wb") as f:
                 f.write(content)
         except Exception as e:
@@ -655,11 +739,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "file_size": file_size,
             "ref_text": ref_text,
             "embedding_source": "audio",
+            "persistent": persistent,
         }
 
         # Store voice description if provided.
         if speaker_description:
             speaker_data["speaker_description"] = speaker_description
+
+        if metadata_path is not None:
+            speaker_data["metadata_path"] = str(metadata_path)
+            try:
+                with open(metadata_path, "w", encoding="utf-8") as f:
+                    json.dump(speaker_data, f, indent=2, ensure_ascii=True)
+            except Exception as e:
+                raise ValueError(f"Failed to save metadata file: {e}")
 
         self.uploaded_speakers[voice_name_lower] = speaker_data
         self.supported_speakers.add(voice_name_lower)
@@ -1479,17 +1572,31 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("Input text cannot be empty")
             tts_params = {}
             prompt: dict[str, Any] = {"input": request.input}
-            # Resolve ref_audio: explicit request param or uploaded voice
-            ref_src = request.ref_audio
-            if not ref_src and request.voice:
+            # Resolve reference voice with priority:
+            # 1) uploaded speaker by voice name
+            # 2) explicit ref_audio + ref_text provided in request
+            # 3) otherwise fail with voice-not-found style error
+            ref_src = None
+            if request.voice:
                 vl = request.voice.lower()
-                if vl in self.uploaded_speakers:
-                    sp = self.uploaded_speakers[vl]
-                    if sp.get("embedding_source") == "audio":
-                        ref_src = self._get_uploaded_audio_data(request.voice)
-                        if not ref_src:
-                            raise ValueError(f"Audio for voice '{request.voice}' missing")
-                        prompt["ref_text"] = sp.get("ref_text")
+                sp = self.uploaded_speakers.get(vl)
+                if sp and sp.get("embedding_source") == "audio":
+                    ref_src = self._get_uploaded_audio_data(request.voice)
+                    if not ref_src:
+                        raise ValueError(f"Audio for voice '{request.voice}' missing")
+                    prompt["ref_text"] = sp.get("ref_text")
+
+            if not ref_src and request.ref_audio and request.ref_text:
+                ref_src = request.ref_audio
+                prompt["ref_text"] = request.ref_text
+
+            if not ref_src:
+                if request.voice:
+                    raise ValueError(
+                        f"Voice '{request.voice}' not found. "
+                        "Provide a registered uploaded voice, or both 'ref_audio' and 'ref_text'."
+                    )
+                raise ValueError("Voice not found. Provide 'voice', or both 'ref_audio' and 'ref_text'.")
             if ref_src:
                 fmt_err = self._validate_ref_audio_format(ref_src)
                 if fmt_err:
@@ -1704,9 +1811,39 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             request_id = f"speech-{random_uuid()}"
             prompt: dict[str, Any] = {"input": request.input}
-            if request.ref_audio:
-                wav, sr = await self._resolve_ref_audio(request.ref_audio)
-                prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
+            # Resolve reference voice with priority:
+            # 1) uploaded speaker by voice name
+            # 2) explicit ref_audio + ref_text provided in request
+            # 3) otherwise fail with voice-not-found style error
+            ref_src = None
+            if request.voice:
+                voice_lower = request.voice.lower()
+                speaker_info = self.uploaded_speakers.get(voice_lower)
+                if speaker_info and speaker_info.get("embedding_source") == "audio":
+                    ref_src = self._get_uploaded_audio_data(request.voice)
+                    if not ref_src:
+                        raise ValueError(f"Audio for voice '{request.voice}' missing")
+                    prompt["ref_text"] = speaker_info.get("ref_text")
+
+            if not ref_src and request.ref_audio and request.ref_text:
+                ref_src = request.ref_audio
+                prompt["ref_text"] = request.ref_text
+
+            if not ref_src:
+                if request.voice:
+                    raise ValueError(
+                        f"Voice '{request.voice}' not found. "
+                        "Provide a registered uploaded voice, or both 'ref_audio' and 'ref_text'."
+                    )
+                raise ValueError("Voice not found. Provide 'voice', or both 'ref_audio' and 'ref_text'.")
+
+            fmt_err = self._validate_ref_audio_format(ref_src)
+            if fmt_err:
+                raise ValueError(fmt_err)
+            wav, sr = await self._resolve_ref_audio(ref_src)
+            prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
+
+            # Request-level ref_text has precedence over stored ref_text.
             if request.ref_text:
                 prompt["ref_text"] = request.ref_text
             if request.language:
