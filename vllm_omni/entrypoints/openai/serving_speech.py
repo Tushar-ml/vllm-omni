@@ -1590,13 +1590,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ref_src = request.ref_audio
                 prompt["ref_text"] = request.ref_text
 
-            if not ref_src:
-                if request.voice:
-                    raise ValueError(
-                        f"Voice '{request.voice}' not found. "
-                        "Provide a registered uploaded voice, or both 'ref_audio' and 'ref_text'."
-                    )
-                raise ValueError("Voice not found. Provide 'voice', or both 'ref_audio' and 'ref_text'.")
             if ref_src:
                 fmt_err = self._validate_ref_audio_format(ref_src)
                 if fmt_err:
@@ -1828,14 +1821,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if not ref_src and request.ref_audio and request.ref_text:
                 ref_src = request.ref_audio
                 prompt["ref_text"] = request.ref_text
-
-            if not ref_src:
-                if request.voice:
-                    raise ValueError(
-                        f"Voice '{request.voice}' not found. "
-                        "Provide a registered uploaded voice, or both 'ref_audio' and 'ref_text'."
-                    )
-                raise ValueError("Voice not found. Provide 'voice', or both 'ref_audio' and 'ref_text'.")
 
             fmt_err = self._validate_ref_audio_format(ref_src)
             if fmt_err:
