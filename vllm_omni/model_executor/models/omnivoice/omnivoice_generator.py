@@ -277,6 +277,8 @@ class OmniVoiceGenerator(nn.Module):
         # Precompute RoPE
         self._rope_cos = None
         self._rope_sin = None
+        self._compiled_transformer_forward = None
+        self._compile_failed = False
 
     def _ensure_rope(self, seq_len: int, device: torch.device) -> None:
         """Lazily compute RoPE cos/sin if needed."""
@@ -345,6 +347,46 @@ class OmniVoiceGenerator(nn.Module):
             )
 
         return self.norm(hidden_states)
+
+    def enable_transformer_compile(self) -> None:
+        """Compile only transformer forward (LLM-equivalent path)."""
+        if not hasattr(torch, "compile"):
+            return
+        if self._compiled_transformer_forward is not None or self._compile_failed:
+            return
+        try:
+            self._compiled_transformer_forward = torch.compile(
+                self._transformer_forward,
+                mode="max-autotune",
+                fullgraph=True,
+                dynamic=True,
+            )
+            logger.info("Compiled OmniVoice transformer forward with torch.compile().")
+        except Exception as exc:
+            self._compile_failed = True
+            logger.warning(
+                "torch.compile failed for OmniVoice transformer forward, using eager mode: %s",
+                exc,
+            )
+
+    def _run_transformer_forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        model_fwd = self._compiled_transformer_forward or self._transformer_forward
+        try:
+            return model_fwd(inputs_embeds, attention_mask)
+        except Exception as exc:
+            if model_fwd is self._transformer_forward or self._compile_failed:
+                raise
+            self._compile_failed = True
+            self._compiled_transformer_forward = None
+            logger.warning(
+                "OmniVoice transformer compile runtime failure; fallback to eager: %s",
+                exc,
+            )
+            return self._transformer_forward(inputs_embeds, attention_mask)
 
     def _get_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project hidden states to per-codebook logits.
@@ -442,7 +484,7 @@ class OmniVoiceGenerator(nn.Module):
         for step in range(num_step):
             # Prepare embeddings and run transformer
             inputs_embeds = self._prepare_embeddings(input_ids, audio_mask)
-            hidden_states = self._transformer_forward(inputs_embeds, attention_mask)
+            hidden_states = self._run_transformer_forward(inputs_embeds, attention_mask)
             batch_logits = self._get_logits(hidden_states).to(torch.float32)
             # batch_logits: [2*B, 8, S, 1025]
 

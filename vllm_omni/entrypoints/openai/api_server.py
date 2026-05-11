@@ -1075,6 +1075,7 @@ async def upload_voice(
     name: str = Form(...),
     ref_text: str | None = Form(None),
     speaker_description: str | None = Form(None),
+    persistent: bool = Form(True),
 ):
     """Upload a new voice for voice cloning.
 
@@ -1103,15 +1104,29 @@ async def upload_voice(
     Returns:
         JSON response with voice information
     """
+    def _error_response(message: str, status_code: int = HTTPStatus.BAD_REQUEST.value):
+        tokenization_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        if tokenization_server is not None:
+            return tokenization_server.create_error_response(message=message)
+        return JSONResponse(
+            content={
+                "error": {
+                    "message": message,
+                    "type": "BadRequestError" if status_code < 500 else "InternalServerError",
+                    "param": None,
+                    "code": status_code,
+                }
+            },
+            status_code=status_code,
+        )
+
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        return _error_response("The model does not support Speech API", status_code=HTTPStatus.NOT_FOUND.value)
 
     try:
         if speaker_embedding is not None and audio_sample is not None:
-            return base(raw_request).create_error_response(
-                message="'audio_sample' and 'speaker_embedding' are mutually exclusive"
-            )
+            return _error_response("'audio_sample' and 'speaker_embedding' are mutually exclusive")
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
         elif audio_sample is not None:
@@ -1121,19 +1136,21 @@ async def upload_voice(
                 name,
                 ref_text=ref_text,
                 speaker_description=speaker_description,
+                persistent=persistent,
             )
         else:
-            return base(raw_request).create_error_response(
-                message="Either 'audio_sample' or 'speaker_embedding' must be provided"
-            )
+            return _error_response("Either 'audio_sample' or 'speaker_embedding' must be provided")
 
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
-        return base(raw_request).create_error_response(message=str(e))
+        return _error_response(str(e))
     except Exception as e:
         logger.exception(f"Failed to upload voice: {e}")
-        return base(raw_request).create_error_response(message=f"Failed to upload voice: {str(e)}")
+        return _error_response(
+            f"Failed to upload voice: {str(e)}",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
 
 
 @router.delete(

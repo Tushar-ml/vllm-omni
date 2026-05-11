@@ -274,6 +274,7 @@ class OmniVoiceModel(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        self._vllm_config = vllm_config
         self.have_multimodal_outputs = True
         self.model_stage = vllm_config.model_config.model_stage
         self.model_dir = vllm_config.model_config.model
@@ -284,6 +285,7 @@ class OmniVoiceModel(
             )
 
             self.generator = OmniVoiceGenerator(self.config)
+            self._maybe_compile_generator()
             self.model = self.generator
         elif self.model_stage == "omnivoice_decoder":
             from vllm_omni.model_executor.models.omnivoice.omnivoice_decoder import (
@@ -294,6 +296,28 @@ class OmniVoiceModel(
             self.model = self.decoder
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
+
+    def _maybe_compile_generator(self) -> None:
+        """Compile OmniVoice transformer path in inference mode when allowed."""
+        if self.model_stage != "omnivoice_generator":
+            return
+        model_cfg = getattr(self._vllm_config, "model_config", None)
+        if model_cfg and getattr(model_cfg, "enforce_eager", False):
+            logger.info("OmniVoice generator torch.compile disabled by --enforce-eager.")
+            return
+        if not hasattr(torch, "compile"):
+            return
+        try:
+            os.environ.setdefault(
+                "TORCHINDUCTOR_CACHE_DIR",
+                os.path.join(os.path.expanduser("~"), ".cache", "omnivoice_inductor"),
+            )
+            self.generator.enable_transformer_compile()
+        except Exception as e:
+            logger.warning(
+                "torch.compile setup failed for OmniVoice transformer path, falling back to eager mode: %s",
+                e,
+            )
 
     def embed_input_ids(
         self,
